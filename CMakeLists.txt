@@ -54,20 +54,45 @@ add_custom_command(OUTPUT ${SHADER_OUT_DIR}/triangle.frag.spv
 add_custom_target(shaders DEPENDS ${SHADER_SVPS})
 
 # ---------------------------------------------------------------------------
+# Warning policy: -Wall -Wextra everywhere. The Phase 1 exit criteria demand
+# zero warnings under this set; treating them globally keeps Phase 1+ code
+# honest from day one.
+# ---------------------------------------------------------------------------
+set(ASTRA_WARN_FLAGS -Wall -Wextra)
+
+# Architecture flags. -mcx16 (CMPXCHG16B) is REQUIRED: the slab allocator's
+# ABA-proof free lists use 128-bit double-word CAS. GCC implements 128-bit
+# __atomic builtins through the libatomic helper __atomic_compare_exchange_16,
+# which runs a cmpxchg16b loop when the target has cx16 (otherwise a correct
+# but slower double-lock fallback). Every x86-64 CPU in scope (Ryzen 7 170)
+# has cx16; -mcx16 selects the fast path and keeps the code identical on the
+# shipping MinGW target. libatomic is part of the GCC toolchain (not an
+# external dependency); MinGW-w64 ships it as a static libatomic.a.
+set(ASTRA_ARCH_FLAGS -mcx16)
+set(ASTRA_ATOMIC_LIB atomic)
+
+# ---------------------------------------------------------------------------
+# Shared engine sources (Phase 1: the memory layer)
+# ---------------------------------------------------------------------------
+set(MEM_SOURCES
+    src/memory/slab_allocator.cpp
+    src/memory/memory_budget.cpp)
+
+# ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
-if(WIN32)
-  # WIN32 subsystem (GUI app, no console); MinGW-w64 provides the
-  # WinMain -> main() entry shim.
-  set(ASTRA_EXE_OPTS WIN32)
-else()
-  set(ASTRA_EXE_OPTS "")
-endif()
-
-add_executable(astra ${ASTRA_EXE_OPTS} src/main.cpp)
+# CONSOLE subsystem (no WIN32 flag): the game is launched via .start.bat
+# and prints startup banners, the device probe, and the memory report;
+# those lines must be visible. A silent GUI-subsystem launcher wrapper is
+# a Phase 7 (MP7) polish item.
+add_executable(astra src/main.cpp ${MEM_SOURCES})
 add_dependencies(astra shaders)
-target_include_directories(astra PRIVATE ${VULKAN_HEADERS_DIR})
+target_include_directories(astra PRIVATE ${VULKAN_HEADERS_DIR} ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(astra PRIVATE VK_NO_PROTOTYPES)
+target_compile_options(astra PRIVATE ${ASTRA_WARN_FLAGS} ${ASTRA_ARCH_FLAGS})
+# libatomic: the slab allocator's 128-bit CAS (see slab_allocator.h). Part
+# of the GCC toolchain; MinGW ships it as a static libatomic.a.
+target_link_libraries(astra PRIVATE ${ASTRA_ATOMIC_LIB})
 if(WIN32)
   # Static libgcc/libstdc++ so the shipped folder needs no runtime DLLs.
   target_link_options(astra PRIVATE -static-libgcc -static-libstdc++)
@@ -84,3 +109,30 @@ add_custom_command(TARGET astra POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/output/shaders
   COMMAND ${CMAKE_COMMAND} -E copy ${SHADER_SVPS} ${CMAKE_BINARY_DIR}/output/shaders/
   COMMENT "copying SPIR-V next to the executable")
+
+# ---------------------------------------------------------------------------
+# Tests (Phase 1)
+# ---------------------------------------------------------------------------
+# memory_test: slab allocator + budget tracker (8-thread soak, zero-frag,
+# zero-leak, 60 s stress, >10M alloc/s bench).
+add_executable(memory_test
+    src/memory/memory_test.cpp
+    ${MEM_SOURCES})
+target_include_directories(memory_test PRIVATE ${VULKAN_HEADERS_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(memory_test PRIVATE ${ASTRA_WARN_FLAGS} ${ASTRA_ARCH_FLAGS})
+target_link_libraries(memory_test PRIVATE ${ASTRA_ATOMIC_LIB})
+set_target_properties(memory_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output)
+
+# ring_buffer_test: SPSC ring buffer (1M FIFO, 10M zero-loss MT, >100M
+# items/s bench, 60 s stress, stream->gen backpressure demo).
+add_executable(ring_buffer_test
+    src/core/ring_buffer_test.cpp)
+target_include_directories(ring_buffer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(ring_buffer_test PRIVATE ${ASTRA_WARN_FLAGS} ${ASTRA_ARCH_FLAGS})
+set_target_properties(ring_buffer_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output)
+
+enable_testing()
+add_test(NAME memory_test     COMMAND memory_test)
+add_test(NAME ring_buffer_test COMMAND ring_buffer_test)

@@ -22,12 +22,16 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
-#include <string>
-#include <vector>
+
+#include "memory/slab_allocator.h"
+#include "memory/memory_budget.h"
+
+using namespace astra;  // the memory layer lives in astra::*
 
 
 // ---------------------------------------------------------------------------
@@ -41,9 +45,13 @@ static VkDevice g_device = VK_NULL_HANDLE;
 static VkQueue g_queue = VK_NULL_HANDLE;
 static VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 static VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
-static std::vector<VkImage> g_images;
+// Swapchain image list: fixed capacity (typical count 2-4; kMaxImages
+// leaves headroom) — zero-allocation per the Phase 1 memory rule.
+static constexpr uint32_t kMaxImages = 8;
+static VkImage g_images[kMaxImages];
+static uint32_t g_image_count = 0;
 static VkRenderPass g_render_pass = VK_NULL_HANDLE;
-static std::vector<VkFramebuffer> g_framebuffers;
+static VkFramebuffer g_framebuffers[kMaxImages];
 static VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 static VkPipeline g_pipeline = VK_NULL_HANDLE;
 static VkShaderModule g_vert_module = VK_NULL_HANDLE;
@@ -88,39 +96,45 @@ static const char* device_type_str(VkPhysicalDeviceType t) {
 }
 
 #ifdef _WIN32
-static bool read_file(const std::string& path, std::vector<char>& out) {
-  FILE* f = std::fopen(path.c_str(), "rb");
+// File bytes go through the slab pool (ENGINE category) — the Phase 1
+// zero-system-heap rule. The caller owns the buffer and frees it with
+// slab_free() once the consumer has copied what it needs.
+static bool read_file(const char* path, char** out, size_t* out_len) {
+  FILE* f = std::fopen(path, "rb");
   if (!f) return false;
   if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return false; }
   long n = std::ftell(f);
   if (n <= 0) { std::fclose(f); return false; }
   std::fseek(f, 0, SEEK_SET);
-  out.resize(static_cast<size_t>(n));
-  size_t got = std::fread(out.data(), 1, out.size(), f);
+  char* buf = static_cast<char*>(
+      slab_alloc(static_cast<size_t>(n), MemCategory::ENGINE));
+  if (!buf) { std::fclose(f); return false; }
+  size_t got = std::fread(buf, 1, static_cast<size_t>(n), f);
   std::fclose(f);
-  return got == out.size();
+  if (got != static_cast<size_t>(n)) { slab_free(buf); return false; }
+  *out = buf;
+  *out_len = static_cast<size_t>(n);
+  return true;
 }
 
 // Directory of the running executable (ASCII paths are sufficient for the
 // shipped layout; the project lives in a normal user profile directory).
-static std::string exe_dir() {
+// Writes into the caller's buffer — no std::string (zero-heap rule).
+static const char* exe_dir(char* buf, size_t cap) {
 #ifdef _WIN32
-  char buf[4096];
-  DWORD n = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf) - 1));
-  std::string p(buf, n);
-  size_t slash = p.find_last_of("\\/");
-  if (slash == std::string::npos) return ".";
-  return p.substr(0, slash);
+  DWORD n = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(cap - 1));
+  if (n == 0) { buf[0] = '.'; buf[1] = '\0'; return buf; }
 #else
-  char buf[4096];
-  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-  if (n <= 0) return ".";
+  ssize_t n = readlink("/proc/self/exe", buf, cap - 1);
+  if (n <= 0) { buf[0] = '.'; buf[1] = '\0'; return buf; }
   buf[n] = '\0';
-  std::string p(buf);
-  size_t slash = p.find_last_of("/");
-  if (slash == std::string::npos) return ".";
-  return p.substr(0, slash);
 #endif
+  char* slash = nullptr;
+  for (char* c = buf; *c; ++c)
+    if (*c == '/' || *c == '\\') slash = c;
+  if (!slash) { buf[0] = '.'; buf[1] = '\0'; }
+  else *slash = '\0';
+  return buf;
 }
 #endif  // _WIN32 (windowed-only helpers)
 
@@ -150,9 +164,12 @@ static VkResult create_instance_result() {
   // Validation layers: debug builds only.
   uint32_t nlayers = 0;
   vkEnumerateInstanceLayerProperties(&nlayers, nullptr);
-  std::vector<VkLayerProperties> layers(nlayers);
-  if (nlayers) vkEnumerateInstanceLayerProperties(&nlayers, layers.data());
-  for (const auto& l : layers) {
+  constexpr uint32_t kMaxLayers = 32;
+  if (nlayers > kMaxLayers) nlayers = kMaxLayers;
+  VkLayerProperties layers[kMaxLayers];
+  if (nlayers) vkEnumerateInstanceLayerProperties(&nlayers, layers);
+  for (uint32_t li = 0; li < nlayers; ++li) {
+    const VkLayerProperties& l = layers[li];
     if (std::strcmp(l.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
       static const char* kValidation = "VK_LAYER_KHRONOS_validation";
       ci.enabledLayerCount = 1;
@@ -170,6 +187,15 @@ static VkResult create_instance_result() {
 // Headless mode
 // ---------------------------------------------------------------------------
 static int run_headless() {
+  // CI/sandbox-friendly: if the Vulkan runtime itself is absent, the GPU
+  // probe is skipped and the memory-subsystem report still runs. A loaded
+  // runtime that then fails instance creation is still reported below.
+  if (!g_vklib) {
+    std::printf(
+        "WARNING: Vulkan runtime not present in this environment - "
+        "skipping the GPU probe (headless memory smoke only).\n");
+    return 0;
+  }
   VkResult r = create_instance_result();
   if (r != VK_SUCCESS) {
     if (r == VK_ERROR_INCOMPATIBLE_DRIVER) {
@@ -187,8 +213,10 @@ static int run_headless() {
 
   uint32_t count = 0;
   vkEnumeratePhysicalDevices(g_instance, &count, nullptr);
-  std::vector<VkPhysicalDevice> devs(count);
-  if (count) vkEnumeratePhysicalDevices(g_instance, &count, devs.data());
+  constexpr uint32_t kMaxDevs = 16;
+  if (count > kMaxDevs) count = kMaxDevs;
+  VkPhysicalDevice devs[kMaxDevs];
+  if (count) vkEnumeratePhysicalDevices(g_instance, &count, devs);
 
   std::printf("Astra Cosmos - headless Vulkan probe\n");
   std::printf("physical devices: %u\n", static_cast<unsigned>(count));
@@ -200,8 +228,10 @@ static int run_headless() {
 
     uint32_t qf = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qf, nullptr);
-    std::vector<VkQueueFamilyProperties> fams(qf);
-    if (qf) vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qf, fams.data());
+    constexpr uint32_t kMaxFams = 16;
+    if (qf > kMaxFams) qf = kMaxFams;
+    VkQueueFamilyProperties fams[kMaxFams];
+    if (qf) vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qf, fams);
 
     std::printf("[%u] %-40s type=%-10s api=%u.%u.%u driver=%u.%u.%u vendors=%u queues=%u\n",
                 static_cast<unsigned>(i),
@@ -313,8 +343,10 @@ static bool select_physical_device() {
     std::fprintf(stderr, "[astra] no Vulkan physical devices\n");
     return false;
   }
-  std::vector<VkPhysicalDevice> devs(count);
-  vkEnumeratePhysicalDevices(g_instance, &count, devs.data());
+  constexpr uint32_t kMaxDevs = 16;
+  if (count > kMaxDevs) count = kMaxDevs;
+  VkPhysicalDevice devs[kMaxDevs];
+  vkEnumeratePhysicalDevices(g_instance, &count, devs);
 
   // Preference: first integrated GPU with a surface (the Vega 8 laptop),
   // then first discrete, then any surface-capable device.
@@ -347,8 +379,10 @@ static bool select_physical_device() {
 static uint32_t find_graphics_queue_family() {
   uint32_t count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &count, nullptr);
-  std::vector<VkQueueFamilyProperties> fams(count);
-  vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &count, fams.data());
+  constexpr uint32_t kMaxFams = 16;
+  if (count > kMaxFams) count = kMaxFams;
+  VkQueueFamilyProperties fams[kMaxFams];
+  vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &count, fams);
   for (uint32_t i = 0; i < count; ++i) {
     if (fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) return i;
   }
@@ -387,14 +421,23 @@ static bool create_swapchain(VkExtent2D* out_extent, VkFormat* out_format) {
   // Format: prefer B8G8R8A8_SRGB, else the first offered.
   uint32_t nfmt = 0;
   vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &nfmt, nullptr);
-  std::vector<VkSurfaceFormatKHR> fmts(nfmt ? nfmt : 1);
-  if (nfmt) vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &nfmt, fmts.data());
+  constexpr uint32_t kMaxFmts = 32;
+  if (nfmt > kMaxFmts) nfmt = kMaxFmts;
+  VkSurfaceFormatKHR fmts[kMaxFmts];
+  if (nfmt) {
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &nfmt, fmts);
+  } else {
+    // A zero-format query is invalid per spec; fall back to the same
+    // UNDEFINED state the old default-constructed vector held.
+    fmts[0] = VkSurfaceFormatKHR{};
+    nfmt = 1;
+  }
   VkFormat format = fmts[0].format;
   VkColorSpaceKHR color_space = fmts[0].colorSpace;
-  for (const auto& f : fmts) {
-    if (f.format == VK_FORMAT_B8G8R8A8_SRGB) {
-      format = f.format;
-      color_space = f.colorSpace;
+  for (uint32_t i = 0; i < nfmt; ++i) {
+    if (fmts[i].format == VK_FORMAT_B8G8R8A8_SRGB) {
+      format = fmts[i].format;
+      color_space = fmts[i].colorSpace;
       break;
     }
   }
@@ -410,9 +453,11 @@ static bool create_swapchain(VkExtent2D* out_extent, VkFormat* out_format) {
   VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
   uint32_t nmode = 0;
   vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &nmode, nullptr);
-  if (nmode == 1) {
-    std::vector<VkPresentModeKHR> modes(1);
-    if (vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &nmode, modes.data()) == VK_SUCCESS) {
+  if (nmode >= 1) {
+    constexpr uint32_t kMaxModes = 16;
+    if (nmode > kMaxModes) nmode = kMaxModes;
+    VkPresentModeKHR modes[kMaxModes];
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &nmode, modes) == VK_SUCCESS) {
       present_mode = modes[0];
     }
   }
@@ -421,6 +466,7 @@ static bool create_swapchain(VkExtent2D* out_extent, VkFormat* out_format) {
   uint32_t img_count = (caps.minImageCount > 0) ? caps.minImageCount + 1 : 2;
   if (caps.maxImageCount > 0 && img_count > caps.maxImageCount) img_count = caps.maxImageCount;
   if (img_count < 2) img_count = 2;
+  if (img_count > kMaxImages) img_count = kMaxImages;  // fixed-array bound
 
   // Extent: the window client rect, clamped to the surface capabilities.
   RECT rc{};
@@ -454,8 +500,9 @@ static bool create_swapchain(VkExtent2D* out_extent, VkFormat* out_format) {
     return false;
   }
   vkGetSwapchainImagesKHR(g_device, g_swapchain, &img_count, nullptr);
-  g_images.resize(img_count);
-  vkGetSwapchainImagesKHR(g_device, g_swapchain, &img_count, g_images.data());
+  if (img_count > kMaxImages) img_count = kMaxImages;  // safety clamp
+  g_image_count = img_count;
+  vkGetSwapchainImagesKHR(g_device, g_swapchain, &img_count, g_images);
   *out_extent = ext;
   *out_format = format;
   return true;
@@ -499,8 +546,7 @@ static bool create_render_pass(VkFormat format) {
 }
 
 static bool create_framebuffers(const VkExtent2D& ext) {
-  g_framebuffers.resize(g_images.size());
-  for (size_t i = 0; i < g_images.size(); ++i) {
+  for (uint32_t i = 0; i < g_image_count; ++i) {
     VkFramebufferCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fci.renderPass = g_render_pass;
@@ -517,28 +563,37 @@ static bool create_framebuffers(const VkExtent2D& ext) {
   return true;
 }
 
-static VkShaderModule load_shader(const std::string& path) {
-  std::vector<char> spv;
-  if (!read_file(path, spv)) {
-    std::fprintf(stderr, "[astra] cannot read shader: %s\n", path.c_str());
+static VkShaderModule load_shader(const char* path) {
+  // SPIR-V bytes come from the slab pool; vkCreateShaderModule copies the
+  // code, so the buffer is freed before this returns.
+  char* spv = nullptr;
+  size_t spv_len = 0;
+  if (!read_file(path, &spv, &spv_len)) {
+    std::fprintf(stderr, "[astra] cannot read shader: %s\n", path);
     return VK_NULL_HANDLE;
   }
   VkShaderModuleCreateInfo sci{};
   sci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-  sci.codeSize = spv.size();
-  sci.pCode = reinterpret_cast<const uint32_t*>(spv.data());
+  sci.codeSize = spv_len;
+  sci.pCode = reinterpret_cast<const uint32_t*>(spv);
   VkShaderModule module = VK_NULL_HANDLE;
-  if (vkCreateShaderModule(g_device, &sci, nullptr, &module) != VK_SUCCESS) {
-    std::fprintf(stderr, "[astra] vkCreateShaderModule failed for %s\n", path.c_str());
+  VkResult r = vkCreateShaderModule(g_device, &sci, nullptr, &module);
+  slab_free(spv);
+  if (r != VK_SUCCESS) {
+    std::fprintf(stderr, "[astra] vkCreateShaderModule failed for %s\n", path);
     return VK_NULL_HANDLE;
   }
   return module;
 }
 
 static bool create_pipeline(VkExtent2D ext) {
-  const std::string dir = exe_dir();
-  g_vert_module = load_shader(dir + "/shaders/triangle.vert.spv");
-  g_frag_module = load_shader(dir + "/shaders/triangle.frag.spv");
+  char dirbuf[4096];
+  const char* dir = exe_dir(dirbuf, sizeof(dirbuf));
+  char vpath[4300], fpath[4300];
+  std::snprintf(vpath, sizeof(vpath), "%s/shaders/triangle.vert.spv", dir);
+  std::snprintf(fpath, sizeof(fpath), "%s/shaders/triangle.frag.spv", dir);
+  g_vert_module = load_shader(vpath);
+  g_frag_module = load_shader(fpath);
   if (!g_vert_module || !g_frag_module) return false;
 
   VkPushConstantRange push{};
@@ -736,7 +791,8 @@ static void destroy_windowed_resources() {
     vkDeviceWaitIdle(g_device);
     if (g_vertex_mem) vkFreeMemory(g_device, g_vertex_mem, nullptr);
     if (g_vertex_buffer) vkDestroyBuffer(g_device, g_vertex_buffer, nullptr);
-    for (auto fb : g_framebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    for (uint32_t i = 0; i < g_image_count; ++i)
+      vkDestroyFramebuffer(g_device, g_framebuffers[i], nullptr);
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_pipeline_layout) vkDestroyPipelineLayout(g_device, g_pipeline_layout, nullptr);
     if (g_vert_module) vkDestroyShaderModule(g_device, g_vert_module, nullptr);
@@ -794,8 +850,8 @@ static int run_windowed() {
     return 1;
   }
 
-  std::printf("[astra] swapchain %ux%u, images=%zu — ESC to quit\n",
-              ext.width, ext.height, g_images.size());
+  std::printf("[astra] swapchain %ux%u, images=%u — ESC to quit\n",
+              ext.width, ext.height, static_cast<unsigned>(g_image_count));
   std::fflush(stdout);
 
   // -----------------------------------------------------------------
@@ -892,6 +948,48 @@ static int run_windowed() {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Memory report (Phase 1): printed at shutdown — the leak check and the
+// budget-tracker verification. The debug HUD (later in MP1) reads the same
+// snapshot live.
+// ---------------------------------------------------------------------------
+static void print_memory_report() {
+  auto& alloc = SlabAllocator::get();
+  MemoryBudget::Stats s = MemoryBudget::get().snapshot();
+  const char* names[static_cast<int>(MemCategory::COUNT)] = {
+      "ENGINE", "CHUNKS", "ASSETS", "AUDIO", "UI"};
+  std::printf("---- Astra memory report ----\n");
+  for (int k = 0; k < static_cast<int>(MemCategory::COUNT); ++k) {
+    std::printf(
+        "  %-7s in_use=%8llu MB  peak=%8llu MB  budget=%8llu MB  allocs=%llu  violations=%llu\n",
+        names[k],
+        static_cast<unsigned long long>(s.category[k].in_use >> 20),
+        static_cast<unsigned long long>(s.category[k].peak >> 20),
+        static_cast<unsigned long long>(s.category[k].budget >> 20),
+        static_cast<unsigned long long>(s.category[k].alloc_count),
+        static_cast<unsigned long long>(s.category[k].violations));
+  }
+  uint64_t live = 0, freeb = 0, total = 0;
+  for (int c = 0; c < SlabConfig::kClassCount; ++c) {
+    live += alloc.class_live_blocks(c);
+    freeb += alloc.class_free_blocks(c);
+    total += alloc.class_total_blocks(c);
+  }
+  std::printf(
+      "  slab: live_blocks=%llu free_blocks=%llu total_blocks=%llu oom=%llu\n",
+      static_cast<unsigned long long>(live),
+      static_cast<unsigned long long>(freeb),
+      static_cast<unsigned long long>(total),
+      static_cast<unsigned long long>(alloc.oom_total()));
+  std::printf("  total in_use=%llu MB / %llu MB budget  peak=%llu MB  %s\n",
+              static_cast<unsigned long long>(s.total_in_use >> 20),
+              static_cast<unsigned long long>(s.total_budget >> 20),
+              static_cast<unsigned long long>(s.total_peak >> 20),
+              live == 0 ? "LEAK CHECK: PASS (0 live blocks)"
+                        : "LEAK CHECK: FAIL (live blocks remain)");
+  std::fflush(stdout);
+}
+
 int main(int argc, char** argv) {
   bool headless = false;
   for (int i = 1; i < argc; ++i) {
@@ -900,9 +998,21 @@ int main(int argc, char** argv) {
     // ignored in Phase 0; they become real flags in Phase 1.
   }
 
+  // Phase 1 (TDD T-015): the entire engine memory budget is the 8 GB slab
+  // pool. It must be up BEFORE anything else — and certainly before Vulkan
+  // — because every engine allocation flows through it (zero system-heap
+  // rule). ASTRA_POOL_MB overrides the pool size for dev/test profiles.
+  uint64_t pool_bytes = SlabConfig::kPoolBytes;
+  if (const char* e = std::getenv("ASTRA_POOL_MB")) {
+    uint64_t mb = std::strtoull(e, nullptr, 10);
+    if (mb >= 64) pool_bytes = mb << 20;
+  }
+  if (!SlabAllocator::get().init(pool_bytes)) return 1;
+
   const char* err = nullptr;
-  if (!vk_load_library(&err)) {
+  if (!vk_load_library(&err) && !headless) {
     std::fprintf(stderr, "[astra] %s\n", err ? err : "Vulkan load failed");
+    SlabAllocator::get().shutdown();
     return 1;
   }
 
@@ -920,6 +1030,8 @@ int main(int argc, char** argv) {
 #endif
   }
 
+  print_memory_report();
+  SlabAllocator::get().shutdown();
   vk_unload_library();
   return rc;
 }

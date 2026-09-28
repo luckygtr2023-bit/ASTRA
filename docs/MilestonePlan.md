@@ -77,6 +77,15 @@ gameplay (rule: no gameplay code in MP0).
 
 ### MP Phase 1 — Engine foundation (Weeks 3–6)
 
+> **Status: IN PROGRESS (2026-09-28).** Foundation landings:
+> slab allocator + memory budget tracker (`src/memory/`, TDD T-015/T-016)
+> and the SPSC ring buffer for stream→gen (`src/core/ring_buffer.h`,
+> TDD T-017) — all test suites green in-sandbox (measured numbers in
+> `docs/PHASE1_FOUNDATION_NOTES.md`). Remaining MP1: renderer v0.1
+> (1.1), job system with measured >70% utilization (1.3), chunk
+> streaming integration (1.4), star field (1.5), `.astroct` format (1.6),
+> TDD → v0.2.0 (1.7).
+
 **Goal.** The Astra runtime exists as a real engine: renderer, memory,
 threading, chunk streaming — with the performance numbers that the whole game
 is built on.
