@@ -1,11 +1,19 @@
 // ===========================================================================
 // Project Astra Cosmos — src/main.cpp
-// Phase 0: "Hello Vulkan" — the last sandbox check before Phase 1.
+// Phase 1 (MP1) entry point. The 8 GB slab pool (src/memory/) is up before
+// Vulkan and is torn down after the final memory report; every engine
+// allocation flows through it (zero-system-heap rule, TDD T-015/T-016).
 //
 // Modes:
-//   --headless  Create a VkInstance, enumerate every physical device
-//               (name, type, driver version), print queue families, select
-//               the first integrated/discrete GPU, clean destroy, exit 0.
+//   --headless  1) Create a VkInstance and enumerate every physical device
+//                 (name, type, driver version), print queue families,
+//                 select the first integrated/discrete GPU (skipped with a
+//                 warning when the runtime itself is absent — CI-friendly).
+//               2) Run the MP1 stream->gen integration demo: a producer
+//                 thread pushes slab-allocated chunk payloads through the
+//                 lock-free SPSC ring; backpressure is retry, never drop.
+//               3) Print the 5-category budget report + leak-check verdict.
+//               Exit 0 iff the demo and leak check pass.
 //   (default)   Raw Win32 window at 1920x1080 (clamped to the work area),
 //               swapchain + render pass + pipeline, a rotating colored
 //               triangle, vsync (VK_PRESENT_MODE_FIFO), ESC to quit.
@@ -24,12 +32,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
 
 #include "memory/slab_allocator.h"
 #include "memory/memory_budget.h"
+#include "core/ring_buffer.h"
 
 using namespace astra;  // the memory layer lives in astra::*
 
@@ -277,6 +287,106 @@ static int run_headless() {
   vkDestroyInstance(g_instance, nullptr);
   g_instance = VK_NULL_HANDLE;
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// MP1 integration example (Phase 1 brief, ring-buffer deliverable 3):
+// stream -> gen through the lock-free SPSC ring.
+//
+// This is the shape of the real chunk pipeline (TDD T-002): the Stream
+// worker (cores 1-2 in the shipped build) decodes a region and pushes
+// StreamJobs; the Gen pool (cores 3-5) pops them and turns the bytes into
+// engine geometry. Here the two roles are one producer thread + this
+// thread, because core pinning belongs to the job system (MP1 deliverable
+// 1.3), which is not part of this foundation module.
+//
+// What it demonstrates:
+//   1. Ownership transfer across threads: the payload is slab_alloc'd by
+//      the producer (CHUNKS category) and slab_free'd by the consumer —
+//      the allocator is the only object the two threads share, which is
+//      exactly how the 8 GB pool is meant to be shared (TDD T-015).
+//   2. Backpressure: the ring is deliberately small (64 jobs). When full,
+//      push() returns false and the producer RETRIES — it never drops, so
+//      the zero-loss guarantee holds. The retry count printed below is the
+//      backpressure signal the real Stream thread will use to slow its own
+//      decode rate.
+//   3. Data integrity: every payload is stamped with its chunk id; the
+//      consumer verifies before freeing, so a memory-ordering bug in the
+//      ring would surface as a failed check here, not as a silent pop-in
+//      in the game.
+//
+// Runs in --headless mode on every path (with or without a Vulkan
+// runtime), so CI exercises the exact ring + slab code the game uses.
+// ---------------------------------------------------------------------------
+struct StreamJob {
+  uint32_t chunk_id;
+  uint8_t* payload;  // slab_alloc'd (CHUNKS); the consumer owns it on pop
+  uint32_t payload_bytes;
+};
+
+static int run_stream_gen_demo() {
+  constexpr uint32_t kChunks = 200000;
+  constexpr uint32_t kPayload = 4096;  // the terrain workhorse size class
+  constexpr uint64_t kRingCap = 64;    // power of two; small on purpose
+
+  RingBuffer<StreamJob, kRingCap> ring;
+
+  std::atomic<bool> done{false};
+  uint64_t produced = 0;      // written by the producer only (joined below)
+  uint64_t backpressure = 0;  // ditto
+
+  std::thread producer([&] {
+    for (uint32_t id = 0; id < kChunks; ++id) {
+      uint8_t* p = static_cast<uint8_t*>(
+          slab_alloc(kPayload, MemCategory::CHUNKS));
+      if (!p) {  // counted OOM — fail loud; dropping a job is forbidden
+        std::fprintf(stderr, "[demo] slab OOM on chunk %u\n", id);
+        return;
+      }
+      const uint8_t stamp = static_cast<uint8_t>(id & 0xFFu);
+      for (uint32_t b = 0; b < kPayload; b += 256) p[b] = stamp;
+      const StreamJob job{id, p, kPayload};
+      while (!ring.push(job)) {  // backpressure: retry, never drop
+        ++backpressure;
+      }
+      ++produced;
+    }
+    done.store(true, std::memory_order_release);
+  });
+
+  uint64_t consumed = 0;
+  uint64_t corrupt = 0;
+  while (consumed < kChunks) {
+    StreamJob job{};
+    if (ring.pop(job)) {
+      const uint8_t stamp = static_cast<uint8_t>(job.chunk_id & 0xFFu);
+      for (uint32_t b = 0; b < job.payload_bytes; b += 256)
+        if (job.payload[b] != stamp) {
+          ++corrupt;
+          break;
+        }
+      slab_free(job.payload);  // consumer took ownership; the pool is whole
+      ++consumed;
+    } else if (done.load(std::memory_order_acquire) && ring.empty()) {
+      break;  // producer gave up (OOM path); report the shortfall
+    }
+  }
+  producer.join();
+
+  std::printf("MP1 stream->gen demo (SPSC ring + slab pool)\n");
+  std::printf("  ring capacity=%llu  produced=%llu  consumed=%llu\n",
+              static_cast<unsigned long long>(kRingCap),
+              static_cast<unsigned long long>(produced),
+              static_cast<unsigned long long>(consumed));
+  std::printf("  backpressure(retry) events=%llu  corrupt payloads=%llu\n",
+              static_cast<unsigned long long>(backpressure),
+              static_cast<unsigned long long>(corrupt));
+  if (corrupt == 0 && consumed == kChunks && produced == kChunks) {
+    std::printf("  zero-loss check: PASS\n");
+    return 0;
+  }
+  std::printf("  zero-loss check: FAIL\n");
+  return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1129,11 @@ int main(int argc, char** argv) {
   int rc;
   if (headless) {
     rc = run_headless();
+    // The MP1 integration example runs on every headless path (with or
+    // without a Vulkan runtime) so CI exercises the ring + slab code the
+    // game uses. A demo failure fails the smoke (rc != 0).
+    const int demo_rc = run_stream_gen_demo();
+    if (demo_rc != 0) rc = demo_rc;
   } else {
 #ifdef _WIN32
     rc = run_windowed();
